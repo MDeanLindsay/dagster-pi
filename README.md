@@ -43,8 +43,10 @@ This creates `~/dagster_pi/` with a `.venv` and the layout described under [Addi
 `create-dagster` installs `dagster` (which provides the daemon and `dagster code-server`) and puts `dagster-webserver` and `dagster-dg-cli` in the dev dependency group. The always-on service needs the webserver at runtime, so promote it:
 
 ```bash
-cd ~/dagster_pi
-uv add dagster-webserver
+cd ~/dagster_piz
+uv add dagster-webserver            # promote to a dependency
+uv remove --dev dagster-webserver   # drop the scaffold's dev-group copy
+
 ```
 
 `uv` resolves this to a version aligned with the `dagster` that `create-dagster` just installed. There is no need to pin a minor version by hand; the tool keeps the family consistent. On 64-bit Pi OS this fetches prebuilt `aarch64` wheels rather than compiling.
@@ -76,7 +78,17 @@ EOF
 
 `DAGSTER_HOME` holds instance state (SQLite run and event storage by default, which is fine for a single Pi). The three blocks above are deliberate low-resource choices — bounded run concurrency, telemetry off, and tick retention so instance state can't grow without limit ([Tuning for low resources](#tuning-for-low-resources-and-measuring-it) explains each). The file is optional; omit it for all-defaults. Here it lives **inside the project** as `.dagster_home/` (gitignored), which keeps the whole deployment in one directory. If you would rather keep instance state separate from code, point `DAGSTER_HOME` at a path outside the repo instead; nothing else changes.
 
-### 5. Create `workspace.yaml`
+### 5. Create the DuckDB data directory
+
+DuckDB will not create intermediate directories itself, so create the folder before the first asset run:
+
+```bash
+mkdir -p ~/dagster-pi/.duckdb
+```
+
+This is where `pi.duckdb` and the spill directory (`.duckdb/.tmp`) will live. The folder is gitignored; override the path at any time with the `PI_DUCKDB_PATH` env var.
+
+### 6. Create `workspace.yaml`
 
 This tells the webserver and daemon where to find the gRPC code server:
 
@@ -90,7 +102,7 @@ load_from:
 EOF
 ```
 
-### 6. Verify the project loads
+### 7. Verify the project loads
 
 Do this before wiring up services:
 
@@ -102,7 +114,7 @@ uv run dg list defs
 
 A fresh project has no definitions yet, which is expected. `dg check defs` should pass without errors.
 
-### 7. Install the three systemd services
+### 8. Install the three systemd services
 
 ```bash
 sudo tee /etc/systemd/system/dagster-code-server.service > /dev/null <<'EOF'
@@ -113,9 +125,9 @@ Wants=network-online.target
 
 [Service]
 User=user
-WorkingDirectory=/home/user/dagster_pi
-Environment=DAGSTER_HOME=/home/user/dagster_pi/.dagster_home
-ExecStart=/home/user/dagster_pi/.venv/bin/dagster code-server start -h 127.0.0.1 -p 4000 -m dagster_pi.definitions
+WorkingDirectory=/home/user/dagster-pi
+Environment=DAGSTER_HOME=/home/user/dagster-pi/.dagster_home
+ExecStart=/home/user/dagster-pi/.venv/bin/dagster code-server start -h 127.0.0.1 -p 4000 -m dagster_pi.definitions
 Restart=on-failure
 RestartSec=5
 
@@ -131,9 +143,9 @@ Wants=network-online.target dagster-code-server.service
 
 [Service]
 User=user
-WorkingDirectory=/home/user/dagster_pi
-Environment=DAGSTER_HOME=/home/user/dagster_pi/.dagster_home
-ExecStart=/home/user/dagster_pi/.venv/bin/dagster-webserver -h 0.0.0.0 -p 3000 -w /home/user/dagster_pi/workspace.yaml
+WorkingDirectory=/home/user/dagster-pi
+Environment=DAGSTER_HOME=/home/user/dagster-pi/.dagster_home
+ExecStart=/home/user/dagster-pi/.venv/bin/dagster-webserver -h 0.0.0.0 -p 3000 -w /home/user/dagster-pi/workspace.yaml
 Restart=on-failure
 RestartSec=5
 
@@ -149,9 +161,9 @@ Wants=network-online.target dagster-code-server.service
 
 [Service]
 User=user
-WorkingDirectory=/home/user/dagster_pi
-Environment=DAGSTER_HOME=/home/user/dagster_pi/.dagster_home
-ExecStart=/home/user/dagster_pi/.venv/bin/dagster-daemon run -w /home/user/dagster_pi/workspace.yaml
+WorkingDirectory=/home/user/dagster-pi
+Environment=DAGSTER_HOME=/home/user/dagster-pi/.dagster_home
+ExecStart=/home/user/dagster-pi/.venv/bin/dagster-daemon run -w /home/user/dagster-pi/workspace.yaml
 Restart=on-failure
 RestartSec=5
 
@@ -160,7 +172,7 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### 8. Enable and start
+### 9. Enable and start
 
 ```bash
 sudo systemctl daemon-reload
@@ -168,7 +180,7 @@ sudo systemctl enable --now dagster-code-server dagster-webserver dagster-daemon
 sudo systemctl status dagster-code-server dagster-webserver dagster-daemon --no-pager
 ```
 
-### 9. Open the UI
+### 10. Open the UI
 
 On the same network, visit:
 
@@ -220,7 +232,7 @@ You can also use the `100.x.y.z` address directly. Enabling MagicDNS in the Tail
 
 ---
 
-## Adding projects, assets, and jobs with `dg`
+## Project Structure
 
 This is the day-to-day workflow: how the project is laid out, and how you add new definitions with the `dg` CLI.
 
@@ -242,22 +254,7 @@ dagster_pi/
     └── __init__.py
 ```
 
-`definitions.py` is generated for you. The generated form below just auto-loads `defs/`; you almost never edit it — the one exception this repo makes is merging in a deployment-level executor default, covered under [Tuning for low resources](#tuning-for-low-resources-and-measuring-it):
-
-```python
-from pathlib import Path
-
-from dagster import definitions, load_from_defs_folder
-
-
-@definitions
-def defs():
-    return load_from_defs_folder(path_within_project=Path(__file__).parent)
-```
-
-That call recursively discovers and loads every module under `defs/`. This is the one rule that drives everything: you never register assets, sensors, or schedules by hand. Organize `defs/` with whatever subfolders you like (`defs/ingestion/`, `defs/analytics/`); nesting is supported and auto-loaded. Moving a file inside `defs/` does not break loading, as long as imports between your own modules stay valid.
-
-### Scaffold, do not hand-write
+### Scaffolding
 
 `dg scaffold` puts files in the right place with boilerplate that is version-matched to core. Run `dg` from inside the project with **`uv run dg`** (it is installed as a project dev dependency). `uvx` is only for the one-time `create-dagster`.
 
@@ -280,19 +277,7 @@ uv run dg list defs    # confirm it registered
 
 `dg check defs` is your fast feedback loop. Run it before clicking **Reload** in the UI or committing.
 
-### Tests
-
-Keep `tests/` as a top-level package that mirrors `defs/`. Assets are plain Python, so test them by calling the function directly with fake resource values, no running instance needed:
-
-```python
-from dagster_pi.defs.ingestion.my_data import my_table
-
-def test_my_table():
-    # pass a stand-in resource, assert on the return or side effects
-    ...
-```
-
-### Picking up changes in the running service
+### Updates
 
 Because the deployment runs a code server (`dagster code-server start`, not a static `dagster api grpc`), it reloads code **without restarting the process**:
 
@@ -300,11 +285,13 @@ Because the deployment runs a code server (`dagster code-server start`, not a st
 2. Only if a reload does not pick things up (for example, you added an installed dependency), restart the service:
    ```bash
    sudo systemctl restart dagster-code-server
+   sudo systemctl restart dagster-webserver
+   sudo systemctl restart
    ```
 
 ---
 
-## Tuning for low resources (and measuring it)
+## Benchmark Tuning
 
 The defaults run fine, but a few deliberate changes make the deployment noticeably lighter on a Pi — and this repo *measures* the effect instead of asserting it. All four are already applied here:
 
@@ -337,10 +324,6 @@ uv run python benchmarks/bench.py --label after
 # run it DURING a backfill to catch the step-worker delta the executor removes
 ```
 
-It reports the live process footprint (RSS by role), cold-import time, and on-disk state growth. A representative idle baseline on a Pi 5 (8 GB, NVMe):
-
-```
-5 procs / ~650 MB RSS · cold import ~0.95 s · 122 compute-log dirs · 44 MB duckdb
-```
+It reports the live process footprint (RSS by role), cold-import time, and on-disk state growth. Generate your own idle baseline with the command above; this repo ships no committed numbers until they're re-measured on the current instance.
 
 Be honest about what moves: idle RSS barely changes (none of these touch the three resident processes) — the wins are the during-backfill step-workers the executor eliminates, the per-run (not per-step) startup tax, and the DuckDB cap as an OOM guardrail. See [benchmarks/README.md](benchmarks/README.md) for the full method, the per-lever rationale, and how to prune run/event history (the one growth vector tick retention doesn't cover).

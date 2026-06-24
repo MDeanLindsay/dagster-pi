@@ -3,18 +3,15 @@ name = "dagster_pi"
 requires-python = ">=3.10,<3.15"
 version = "0.1.0"
 dependencies = [
-    "azure-data-tables>=12.7.0",
     "dagster==1.13.*",
     "dagster-duckdb>=0.29.9",
     "dagster-webserver==1.13.*",
     "duckdb>=1.5.3",
-    "requests>=2.34.2",
 ]
 
 [dependency-groups]
 dev = [
     "dagster-dg-cli",
-    "dagster-webserver",
 ]
 
 [build-system]
@@ -29,8 +26,5 @@ directory_type = "project"
 
 [tool.dg.project]
 root_module = "dagster_pi"
-registry_modules = [
-    "dagster_pi.components.*",
-]
 
 

@@ -45,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VENV_BIN = PROJECT_ROOT / ".venv" / "bin"
 VENV_PY = VENV_BIN / "python"
 DAGSTER_HOME = Path(os.getenv("DAGSTER_HOME", str(PROJECT_ROOT / ".dagster_home")))
-DUCKDB_PATH = Path(os.getenv("PI_DUCKDB_PATH", str(PROJECT_ROOT / "data" / "pi.duckdb")))
+DUCKDB_PATH = Path(os.getenv("PI_DUCKDB_PATH", str(PROJECT_ROOT / ".duckdb" / "pi.duckdb")))
 RESULTS = Path(__file__).resolve().parent / "results.jsonl"
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 

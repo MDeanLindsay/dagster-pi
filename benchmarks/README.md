@@ -40,17 +40,14 @@ so it's safe to run against the live service.
 
 ## Numbers
 
-### Baseline — idle, multiprocess executor (committed)
+### Baseline (re-measure on your box)
 
-```
-Live processes: 5  |  total RSS: 648 MB
-    webserver          x1  194 MB
-    code-server-grpc   x1  174 MB
-    daemon             x1  159 MB
-    code-server        x1  104 MB
-    mp-tracker         x1   16 MB
-Cold import dagster_pi.definitions: 0.946s (median of 3)
-State: history 46 MB · 122 compute-log dirs · duckdb 44 MB
+No committed numbers yet: the figures here came from the pre-split instance and
+have been cleared. Capture a fresh idle baseline on your own deployment, then run
+the before/after executor experiment below to fill in the headline comparison:
+
+```bash
+uv run python benchmarks/bench.py --label idle
 ```
 
 ### What moves, and what doesn't
@@ -59,15 +56,14 @@ Be honest about the levers: **idle RSS barely changes** — at rest there are no
 step-workers, and none of these four changes touch the three resident processes.
 The wins are elsewhere:
 
-- **During a run**, the multiprocess executor forks a step-worker per step; a
-  concurrent backfill (`max_concurrent_runs: 4`) was observed spawning
-  **~6 × 150 MB ≈ 900 MB** of transient `multiprocessing.spawn` workers on top of
-  the 648 MB idle base. `in_process_executor` eliminates those forks — steps run
-  inside each run-worker. **To measure it:** backfill the bundled synthetic workload
-  (below) and run `bench.py --label during-backfill` before and after the switch;
-  compare the `step-worker` line.
-- **Startup latency:** the ~0.95 s cold import is paid once per *run* now, not once
-  per *step*.
+- **During a run**, the multiprocess executor forks a ~150 MB step-worker per step;
+  a concurrent backfill (`max_concurrent_runs: 4`) stacks several of these on top of
+  the idle base. `in_process_executor` eliminates those forks — steps run inside each
+  run-worker. **To measure it:** backfill the bundled synthetic workload (below) and
+  run `bench.py --label during-backfill` before and after the switch; compare the
+  `step-worker` line.
+- **Startup latency:** the cold import is paid once per *run* now, not once per
+  *step*.
 - **Blast radius:** the DuckDB cap is a guardrail — its payoff is a heavy query (or
   a buggy one) no longer being able to OOM the box; not a number you see at idle.
 
@@ -106,7 +102,7 @@ cleans up.
 ## Keeping state bounded (the other half of "retention")
 
 The `retention:` block in `dagster.yaml` only covers **schedule/sensor ticks**.
-Run + event history and the per-run compute-log dirs (122 and counting above) are
+Run + event history and the per-run compute-log dirs are
 **not** auto-pruned in Dagster OSS. Delete old runs — which also clears their event
 logs and compute logs — with a periodic sweep over the instance API:
 

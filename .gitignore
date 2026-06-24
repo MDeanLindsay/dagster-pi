@@ -211,16 +211,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local-only: instance data, agent tooling, and private notes. The public
+# template surface is src/dagster_pi/defs/ (shared resources + the synthetic
+# benchmark workload); the DuckDB file and spill dir are covered by *.duckdb above.
 data/
-docs/ 
-queries/
 .dg/
 .claude/
-
-# Publish defs/ as the public template surface (shared resources + the synthetic
-# benchmark workload), but keep the private asset domains out of the public repo:
-src/dagster_pi/defs/microsoft/
-src/dagster_pi/defs/tableau/
 CLAUDE.md
-
-.env.example
