@@ -134,20 +134,18 @@ Wants=network-online.target
 User=user
 WorkingDirectory=/home/user/dagster-pi
 Environment=DAGSTER_HOME=/home/user/dagster-pi/.dagster_home
-# glibc heap tuning; run-workers inherit it (see Tuning).
+
 Environment=MALLOC_ARENA_MAX=2
 Environment=MALLOC_TRIM_THRESHOLD_=131072
 ExecStart=/home/user/dagster-pi/.venv/bin/dagster code-server start -h 127.0.0.1 -p 4000 -m dagster_pi.definitions
 Restart=on-failure
 RestartSec=5
 
-MemoryHigh=4G
-# MemoryMax needs the memory cgroup controller, else a silent no-op.
 MemoryMax=5G
+MemoryHigh=4G
 CPUWeight=100
 IOWeight=100
 Nice=10
-# Per-process address-space guard; works without the controller.
 LimitAS=6G
 
 [Install]
@@ -269,21 +267,13 @@ Stock defaults run fine. The changes below (all already applied in this repo) ma
 | Telemetry off | [dagster.yaml](.dagster_home/dagster.yaml) | No usage stats leave the box. | n/a |
 | Tick retention | [dagster.yaml](.dagster_home/dagster.yaml) | Schedule/sensor ticks auto-purge instead of growing forever. | n/a |
 
-The executor is the one intentional edit to the generated `definitions.py`, a deployment-level default the `defs/` folder can't express:
-
-```python
-@dg.definitions
-def defs() -> dg.Definitions:
-    return dg.Definitions.merge(
-        dg.load_from_defs_folder(path_within_project=Path(__file__).parent),
-        dg.Definitions(executor=dg.in_process_executor),
-    )
-```
 
 ### What moves, and what doesn't
 
 - **Idle is unchanged.** At rest there are no workers, so the executor and concurrency levers do nothing; the three resident services sit at ~485 MB PSS total. The one idle effect is the glibc cap (~7%), kept only on the code-server, where run-worker propagation is proven.
+
 - **The 378 MB saving is during a backfill.** It is the step-worker tier the executor removes, and it scales with `max_concurrent_runs × steps-per-run`.
+
 - **The DuckDB cap is a guardrail, not a footprint cut.** Its payoff: a heavy or buggy query can no longer grab most of RAM and all cores and OOM the box.
 
 ### Running a job heavier than the cap
@@ -308,14 +298,7 @@ The `[Service]` caps in [step 8](#8-install-the-three-systemd-services) put each
 | `MemoryHigh` / `MemoryMax` | Throttle or OOM-kill a runaway run inside the code-server cgroup. Needs the kernel memory cgroup controller. | **No** (controller disabled at boot here) |
 | `IOWeight` | Proportional disk I/O, only with a `bfq`-scheduled device. NVMe's default `none` scheduler exposes no `io.weight`. | **No** (harmless on NVMe) |
 
-On this host, CPU priority and `LimitAS` are proven. `MemoryMax` is inert because the memory controller is off at boot, so aggregate protection rests on `max_concurrent_runs × DuckDB memory_limit` (3 × 1.5 G = 4.5 G) staying within RAM. On a stock Raspberry Pi OS install the controller is on by default and `MemoryMax` takes over that role.
-
-> **Gotcha: `MemoryMax` is a silent no-op without the memory cgroup controller.** `systemctl show` reports the cap even when the kernel isn't enforcing it. Check:
-> ```bash
-> cat /sys/fs/cgroup/cgroup.controllers          # 'memory' must be listed
-> grep -o 'cgroup[_a-z]*=[a-z]*' /proc/cmdline    # look for cgroup_disable=memory
-> ```
-> If `memory` is absent, remove `cgroup_disable=memory` (and on older images add `cgroup_enable=memory cgroup_memory=1`) in `/boot/firmware/cmdline.txt`, then reboot. If that doesn't change `/proc/cmdline`, your cmdline is set by the bootloader/hypervisor and must be changed there (the case on this box, hence the `LimitAS` fallback).
+On this host, CPU priority and `LimitAS` are proven. `MemoryHigh`/`MemoryMax` need the kernel memory cgroup controller, which is off at boot here, so they are inert. The trap worth knowing: `systemctl show` reports the cap as set even when the kernel isn't enforcing it, so confirm the controller is actually loaded with `cat /sys/fs/cgroup/cgroup.controllers` (it must list `memory`; if not, enable it in `/boot/firmware/cmdline.txt` and reboot). Until then, aggregate protection rests on `max_concurrent_runs × DuckDB memory_limit` (3 × 1.5 G = 4.5 G) staying within RAM; on a stock Raspberry Pi OS install the controller is on by default and `MemoryMax` takes over.
 
 Prove the guardrail with the bundled workload; a run that overshoots both caps should fail while the UI stays responsive:
 
@@ -323,10 +306,9 @@ Prove the guardrail with the bundled workload; a run that overshoots both caps s
 uv run dagster job launch -j synthetic_load_job -w workspace.yaml \
   --tags '{"dagster/partition":"part-000"}' \
   --config-json '{"ops":{"synthetic_load":{"config":{"rows":1,"mem_mb":7000}}}}'
-# controller on  -> OOM-killed inside the cgroup (journalctl -k | grep -i oom)
-# controller off -> the step raises MemoryError (see the run's logs)
-# run SUCCEEDS    -> neither cap enforced; recheck the gotcha above
 ```
+
+> Controller On: OOM-killed inside the cgroup. Controller Off: The step raises MemoryError (see the run's logs).
 
 Caps take effect only after `sudo systemctl daemon-reload && sudo systemctl restart dagster-code-server dagster-webserver dagster-daemon`.
 
