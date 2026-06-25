@@ -39,6 +39,8 @@ import time
 import dagster as dg
 from dagster_duckdb import DuckDBResource
 
+from dagster_pi.defs.resources import spill_watch
+
 # Partition count == max fan-out of a full backfill. Override with BENCH_PARTITIONS.
 _N_PARTITIONS = int(os.getenv("BENCH_PARTITIONS", "24"))
 synthetic_partitions = dg.StaticPartitionsDefinition(
@@ -84,7 +86,10 @@ def synthetic_load(
         while time.perf_counter() < deadline:
             spins += 1
 
-    with duckdb.get_connection() as conn:
+    # Watch the DuckDB spill dir for the high-water mark: a large `rows` value can
+    # push the write past the capped memory_limit and spill to disk, which slows the
+    # run instead of failing it. spill_watch logs the peak (and exposes it below).
+    with spill_watch(context) as spill, duckdb.get_connection() as conn:
         conn.execute("CREATE SCHEMA IF NOT EXISTS benchmark")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS benchmark.synthetic_load ("
@@ -92,7 +97,9 @@ def synthetic_load(
             " value DOUBLE, created_at TIMESTAMP)"
         )
         # Delete-and-replace this partition (idempotent).
-        conn.execute("DELETE FROM benchmark.synthetic_load WHERE partition = ?", [partition])
+        conn.execute(
+            "DELETE FROM benchmark.synthetic_load WHERE partition = ?", [partition]
+        )
         # Generate rows server-side in DuckDB so a Python row-build doesn't dominate
         # the timing; this exercises the capped duckdb resource on the write path.
         conn.execute(
@@ -103,7 +110,8 @@ def synthetic_load(
             [partition, config.rows],
         )
         written = conn.execute(
-            "SELECT count(*) FROM benchmark.synthetic_load WHERE partition = ?", [partition]
+            "SELECT count(*) FROM benchmark.synthetic_load WHERE partition = ?",
+            [partition],
         ).fetchone()[0]
 
     del ballast  # release the memory pressure
@@ -117,6 +125,7 @@ def synthetic_load(
             "partition": partition,
             "rows": written,
             "elapsed_seconds": elapsed,
+            "peak_spill_mb": spill.peak_mb,
             "mem_mb": config.mem_mb,
             "cpu_spin_seconds": config.cpu_spin_seconds,
         }
@@ -125,4 +134,6 @@ def synthetic_load(
 
 # A job over just this asset, for a one-click partition backfill from the UI or CLI.
 # It inherits the asset's partitions and the deployment's in_process executor.
-synthetic_load_job = dg.define_asset_job("synthetic_load_job", selection=[synthetic_load])
+synthetic_load_job = dg.define_asset_job(
+    "synthetic_load_job", selection=[synthetic_load]
+)

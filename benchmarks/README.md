@@ -1,132 +1,119 @@
-# Benchmarks — Dagster on a Pi, measured
+# Benchmarks: Dagster on a Pi, measured
 
-A config isn't a project until the claims have numbers behind them. This folder
-holds a dependency-free harness ([bench.py](bench.py)) and the measured effect of
-the deployment's low-resource tuning. Run it before and after a change; it appends
-a JSON record to `results.jsonl` (gitignored) and prints a markdown summary.
+A dependency-free `/proc` harness plus the measured effect of the deployment's low-resource tuning. Run it before and after a change; it appends a JSON record under `benchmarks/results/` (gitignored) and prints a markdown summary.
+
+- [bench.py](bench.py): point-in-time snapshot, tiered into services / run-workers / step-workers.
+- [backfill_probe.py](backfill_probe.py): drives a `synthetic_load` backfill and peak-samples it.
+- [cow_probe.py](cow_probe.py): dumps each run-worker's shared-vs-private page split.
+
+The workload all three drive is the [`synthetic_load`](../src/dagster_pi/defs/benchmarking/synthetic_load.py) asset. The tuning levers they measure are summarized in the [main README](../README.md#tuning-for-low-resources); this folder is where those numbers come from.
 
 ## The box under test
 
-Raspberry Pi 5 · 8 GB RAM · 4 cores · root + data + `DAGSTER_HOME` on **NVMe**
-(no SD card in the I/O path) · Python 3.12 · Dagster 1.13.x · the three-process
-systemd deployment (code-server + webserver + daemon) from the top-level README.
+Raspberry Pi 5, 8 GB RAM, 4 cores, root + data + `DAGSTER_HOME` on NVMe (no SD card in the I/O path), Python 3.12, Dagster 1.13.x, the three-process systemd deployment from the top-level README.
 
 ## What `bench.py` measures
 
-| Metric | What it captures | Why it matters on a Pi |
+| Metric | Captures | Why it matters on a Pi |
 |---|---|---|
-| `processes` | Every live deployment process (count + RSS), classified by role | The multiprocess executor's **~150 MB step-worker** forks show up here *during a run* |
-| `cold_import_s` | Median `python -c "import dagster_pi.definitions"` in a fresh interpreter | The startup tax every forked process pays before doing any work |
-| `state` | run+event history size, compute-log dir count, DuckDB file size | Unbounded instance state is the slow killer of an always-on deployment |
+| `processes` | every live deployment process (count + PSS + RSS), tiered by parent PID into service / run-worker / step-worker | the multiprocess executor's ~100 MB-PSS step-worker forks show up here *during a run* |
+| `cold_import_s` | median `python -c "import dagster_pi.definitions"` in a fresh interpreter | the startup tax every forked process pays before doing any work |
+| `state` | run+event history size, compute-log dir count, DuckDB file size | unbounded instance state is the slow killer of an always-on box |
 
 ```bash
 uv run python benchmarks/bench.py --label before
-# ...apply changes, restart services, let it settle...
+# apply changes, restart services, let it settle
 uv run python benchmarks/bench.py --label after
-# run it DURING a backfill to catch the step-worker delta (see below)
+# run it DURING a backfill to catch the step-worker delta
 ```
 
-It only reads `/proc` and file sizes — never the DuckDB file or instance stores —
-so it's safe to run against the live service.
-
-## Tier-1 tuning applied
-
-| Change | Where | Effect |
-|---|---|---|
-| **`in_process_executor`** | [src/dagster_pi/definitions.py](../src/dagster_pi/definitions.py) | Steps run inside the run process instead of forking a ~150 MB `import dagster` step-worker per step. Removes the biggest transient spike + per-step startup tax. |
-| **Telemetry off** | [.dagster_home/dagster.yaml](../.dagster_home/dagster.yaml) | No usage stats shipped off the box; one fewer background network path. |
-| **Tick retention** | `.dagster_home/dagster.yaml` | Schedule/sensor tick records auto-purge instead of growing forever. |
-| **DuckDB caps** | [src/dagster_pi/defs/resources.py](../src/dagster_pi/defs/resources.py) | `memory_limit=2GB`, `threads=2`, NVMe `temp_directory`. One query can no longer grab ~80% of RAM / all 4 cores and starve the webserver + daemon. |
+It reads only `/proc` and file sizes, never the DuckDB file or instance stores, so it is safe against the live service.
 
 ## Numbers
 
-### Baseline (re-measure on your box)
+Measured on the box above with `dagster 1.13.x`. Figures are **PSS** (proportional set size), which, unlike RSS, does not double-count the shared library pages (libpython, libduckdb) every process maps, so per-process numbers sum honestly across the tree. RSS is shown as an upper bound. Re-run on your own box; absolute numbers will differ, the shape should not.
 
-No committed numbers yet: the figures here came from the pre-split instance and
-have been cleared. Capture a fresh idle baseline on your own deployment, then run
-the before/after executor experiment below to fill in the headline comparison:
+### Idle baseline
 
-```bash
-uv run python benchmarks/bench.py --label idle
-```
+Three resident services + the gRPC code location + the supervisor, at rest:
 
-### What moves, and what doesn't
+| process | PSS | RSS |
+|---|--:|--:|
+| webserver | 146 MB | 168 MB |
+| code-server-grpc | 140 MB | 162 MB |
+| daemon | 121 MB | 144 MB |
+| code-server (supervisor) | 78 MB | 100 MB |
+| **total (idle)** | **~485 MB** | **~575 MB** |
 
-Be honest about the levers: **idle RSS barely changes** — at rest there are no
-step-workers, and none of these four changes touch the three resident processes.
-The wins are elsewhere:
+Cold import of `dagster_pi.definitions`: **0.95 s** (median of 3).
 
-- **During a run**, the multiprocess executor forks a ~150 MB step-worker per step;
-  a concurrent backfill (`max_concurrent_runs: 4`) stacks several of these on top of
-  the idle base. `in_process_executor` eliminates those forks — steps run inside each
-  run-worker. **To measure it:** backfill the bundled synthetic workload (below) and
-  run `bench.py --label during-backfill` before and after the switch; compare the
-  `step-worker` line.
-- **Startup latency:** the cold import is paid once per *run* now, not once per
-  *step*.
-- **Blast radius:** the DuckDB cap is a guardrail — its payoff is a heavy query (or
-  a buggy one) no longer being able to OOM the box; not a number you see at idle.
+### The headline: in_process vs multiprocess, during a backfill
 
-### After (reproduce on your Pi)
-
-The edits are on disk but the **running services still hold the old config** — they
-pick it up on restart:
+Same workload both times: an 8-partition `synthetic_load` backfill at `max_concurrent_runs: 4`, each run a 10 s CPU spin + a 200k-row DuckDB write, driven and peak-sampled by [backfill_probe.py](backfill_probe.py). The peak is the single highest-total-PSS sample while 4 runs execute:
 
 ```bash
-uv run dg check defs                    # confirm defs still load
-sudo systemctl restart dagster-code-server dagster-webserver dagster-daemon
-uv run python benchmarks/bench.py --label after-idle
+uv run python benchmarks/backfill_probe.py --label in_process
+# switch definitions.py to dg.multiprocess_executor, reload, re-run:
+uv run python benchmarks/backfill_probe.py --label multiprocess
 ```
 
-To capture the *during-backfill* numbers — where the executor actually wins — drive
-the bundled **`synthetic_load`** asset ([src/dagster_pi/defs/synthetic_load.py](../src/dagster_pi/defs/synthetic_load.py));
-no private data source needed. It's a partitioned, parameterized workload (`rows`,
-`mem_mb`, `cpu_spin_seconds`) that fans a backfill out into many runs:
+| peak during 4-concurrent backfill | multiprocess | in_process | delta |
+|---|--:|--:|--:|
+| **total PSS** | 1294 MB | 916 MB | **-378 MB** |
+| total RSS | 1793 MB | 1245 MB | -548 MB |
+| live processes | 20 | 18 | -2 |
+| run-workers | 4 × ~98 MB PSS | 4 × ~101 MB PSS | n/a |
+| **step-workers** | 4 × ~100 MB PSS | 0 | **eliminated** |
 
-```bash
-# fan out every partition (UI: Assets -> synthetic_load -> Materialize -> all),
-# or one at a time from the CLI:
-uv run dagster asset materialize --select synthetic_load --partition part-000 \
-    -m dagster_pi.definitions
+multiprocess forks one step-worker per step *on top of* the run-worker, so each concurrent run carries ~2x the footprint; `in_process_executor` runs the step inside the run-worker and the step-worker row goes to zero. **The saving scales with `max_concurrent_runs × steps-per-run`**: ~378 MB at 4 single-step runs, more with wider fan-out or multi-step jobs.
 
-# while the backfill runs, snapshot the footprint:
-uv run python benchmarks/bench.py --label during-backfill
-```
+What does not move:
 
-Take that snapshot once on the multiprocess executor and once on `in_process`, then
-compare the `step-worker` line — that delta is the headline win. Crank `rows` to
-stress the DuckDB caps, or `mem_mb` to prove a systemd `MemoryMax` (Tier 2) bounds a
-single run. Data lands in its own `benchmark` schema; `DROP SCHEMA benchmark CASCADE`
-cleans up.
+- **Idle footprint** is unchanged: at rest there are no workers.
+- **Startup tax:** the ~0.95 s cold import is now paid once per *run*, not per *step*.
+- **DuckDB cap** is a guardrail, not an idle number. Crank `--rows` to exercise spill, or `mem_mb` to prove a systemd `MemoryMax` bounds a single run.
+
+> **Why PSS, and why parent-PID tiering?** With the gRPC code-server, both run-workers and step-workers are `multiprocessing.spawn` children launched as `python -c "...spawn_main(...)"`, indistinguishable by command line, so `bench.py` tiers them by parent PID (a run-worker's parent is the grpc server; a step-worker's parent is a run-worker). They re-import privately, but the resulting shared-library pages are mapped by every process, so RSS double-counts them and PSS divides them.
+
+Data lands in DuckDB's own `benchmark` schema; `DROP SCHEMA benchmark CASCADE` cleans up.
+
+## Why eager-loading the code server won't help (run-workers spawn, not fork)
+
+A tempting optimization: the gRPC code server runs with `--lazy-load-user-code`. If it instead *eager-loaded* at startup, wouldn't concurrent run-workers (its children) inherit those import pages copy-on-write and cost almost nothing each? We measured first, with [cow_probe.py](cow_probe.py): it submits a backfill and dumps each run-worker's `/proc/<pid>/smaps_rollup` at peak concurrency.
+
+**The premise is false: run-workers are `multiprocessing.spawn` children, not forks.** Their command line is `python -c "from multiprocessing.spawn import spawn_main; ..."`, a fresh interpreter that re-imports `dagster` + user code into its *own private heap*. At a 3-concurrent backfill:
+
+| per run-worker (peak of 3) | value |
+|---|--:|
+| RSS | 138 MB |
+| **PSS** | 102 MB |
+| **private / anonymous** (own re-imported heap) | 94 MB |
+| shared (file-backed libraries) | 44 MB |
+| **marginal PSS per concurrent run** | 107 MB (idle 450 to peak 772 MB) |
+
+If workers were forks sharing the parent's imports COW, the split would invert (~90 MB shared / ~10 MB private). It is the opposite (94 MB private) because spawn starts a fresh interpreter, so the parent's resident state cannot transfer. Eager-loading the parent would only enlarge its idle footprint for *zero* per-run benefit. (Forcing `fork`/`forkserver` would enable COW but is unsafe: forking the multi-threaded gRPC server risks deadlock, which is why Dagster spawns.) The ~44 MB workers *do* share is file-backed libraries (libpython, libduckdb), mapped by any process regardless of start method.
+
+So per-run cost is ~107 MB and **unshareable**, and the only levers that cut concurrent-backfill RAM are:
+
+1. **Fewer concurrent workers:** `max_concurrent_runs` 4 to 3, so peak is 3 × ~107 MB, not 4×.
+2. **Keep frequent small work off run-workers.** A recurring health check or metrics scrape should not get its own run; a schedule would spawn a fresh ~107 MB worker (and pay the ~0.95 s re-import) every tick. Do it *inside the resident daemon* via a sensor that acts inline and returns a `SkipReason`, for near-zero marginal RAM.
 
 ## Keeping state bounded (the other half of "retention")
 
-The `retention:` block in `dagster.yaml` only covers **schedule/sensor ticks**.
-Run + event history and the per-run compute-log dirs are
-**not** auto-pruned in Dagster OSS. Delete old runs — which also clears their event
-logs and compute logs — with a periodic sweep over the instance API:
+The `retention:` block in `dagster.yaml` covers **schedule/sensor ticks** only. Run + event history and the per-run compute-log dirs are **not** auto-pruned in Dagster OSS, and `delete_run` clears the run + event log but leaves the on-disk `storage/<run_id>/compute_logs` tree, the fastest-growing leftover.
 
-```python
-# scratch: delete runs that finished more than 90 days ago
-import datetime as dt
-from dagster import DagsterInstance, RunsFilter
-from dagster._core.storage.dagster_run import FINISHED_STATUSES
+This is wired in as an **opt-in** job: [`maintenance_job`](../src/dagster_pi/defs/logs/maintenance.py) + the `daily_maintenance` schedule (cron `0 4 * * *`). It deletes finished runs older than `retention_days` *and* their compute-log dirs, and ships safe-by-default: the schedule is created **STOPPED**, and the op defaults to **`dry_run: true`**. Preview what it would prune:
 
-cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)).timestamp()
-inst = DagsterInstance.get()
-for run in inst.get_runs(filters=RunsFilter(statuses=list(FINISHED_STATUSES))):
-    rec = inst.get_run_record_by_id(run.run_id)
-    if rec and rec.end_time and rec.end_time < cutoff:
-        inst.delete_run(run.run_id)   # removes run + event log + compute logs
+```bash
+uv run dagster job execute -j maintenance_job -m dagster_pi.definitions \
+  -c <(echo 'ops: {prune_old_runs: {config: {retention_days: 90, dry_run: true}}}')
 ```
 
-This is destructive (it drops history), so it's documented rather than wired in.
-The natural home for it is a small daily maintenance schedule under `defs/` — ask
-and it's a 15-line asset.
+To run it for real on a schedule, enable `daily_maintenance` and set `dry_run: false` (Schedules -> daily_maintenance -> edit config).
 
 ## Reproducing from scratch
 
 ```bash
 uv run python benchmarks/bench.py --label my-snapshot   # any label
-cat benchmarks/results.jsonl                            # the rolling local log
+cat benchmarks/results/results.jsonl                    # the rolling local log
 ```

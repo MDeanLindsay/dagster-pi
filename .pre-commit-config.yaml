@@ -1,0 +1,27 @@
+# Pre-commit hooks for going-public hygiene. Install once with:
+#   uv run pre-commit install
+# then hooks run on every `git commit`. Run against all files on demand with:
+#   uv run pre-commit run --all-files
+repos:
+  # Secret scanning: blocks a commit that contains an API key, token, .env value, etc.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # Cheap, universal file hygiene.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  # Lint + format the Python (matches the project's existing style).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+      - id: ruff-format
