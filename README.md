@@ -2,54 +2,52 @@
 
 Self-hosted Dagster as an always-on service on a Pi 5: scheduled ingestion, light transforms, and a real orchestration UI on hardware that costs less than a month of most cloud bills.
 
-This is a from-scratch guide and assumes no prior Dagster. Follow it end to end and you get the same three-process service, tuned for low-resource operation with a benchmark harness behind every tuning claim. Optimization detail lives in [Tuning](#tuning-for-low-resources) section below.
-
-This project contains:
+A from-scratch guide — no prior Dagster needed. Follow it end to end for a three-process service tuned for low-resource operation, with a benchmark behind every tuning claim ([Tuning](#tuning-for-low-resources)).
 
 - Three-process split (code-server / webserver / daemon) for in-place code reloads and crash isolation
 - DuckDB storage with memory and thread caps plus NVMe spill
 - systemd cgroup isolation so a runaway asset can't take down the box
 - A `/proc`-based benchmark harness, safe to run against the live service
 
-**Run this project from NVMe or SSD, not a microSD.** This service writes constantly: SQLite instance state, DuckDB. SD cards are slow under random writes and wear out. A Pi 5 with an NVMe HAT is ideal!
+**Run from NVMe or SSD, not a microSD.** This service writes constantly (SQLite instance state, DuckDB); SD cards are slow under random writes and wear out. A Pi 5 with an NVMe HAT is ideal.
 
 
 ## Clean Pi OS Install
 
-A handful of one-time host changes before installing. None are Dagster-specific; all pay off for an always-on, disk-backed service. The config edits below take effect only on reboot, so make them all first and **reboot once at the end**.
+One-time host changes, none Dagster-specific. The config edits take effect only on reboot, so make them all, then **reboot once at the end**.
 
-**Update the OS first.** Pull current packages and security fixes before anything else:
+**Update the OS.** Current packages and security fixes, before anything else:
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
 ```
 
-**Uncap the PCIe link.** The Pi 5's NVMe slot defaults to Gen 2; force Gen 3 for full bandwidth (helps DuckDB spill). Officially unsupported on the Pi 5 but stable on most drives:
+**Uncap the PCIe link.** The NVMe slot defaults to Gen 2; forcing Gen 3 gives full bandwidth for DuckDB spill. Officially unsupported on the Pi 5 but stable on most drives:
 
 ```bash
 echo 'dtparam=pciex1_gen=3' | sudo tee -a /boot/firmware/config.txt
 ```
 
-**Update the bootloader EEPROM** (separate from `apt`) for current NVMe-boot support and fixes. This stages the update; it applies on the reboot at the end:
+**Update the bootloader EEPROM** (separate from `apt`) for current NVMe-boot support. Staged now, applied on the reboot at the end:
 
 ```bash
 sudo rpi-eeprom-update -a
 ```
 
-**Enable the memory cgroup controller.** Pi OS often leaves it off, which silently neuters the `MemoryMax`/`MemoryHigh` caps the units set in [step 8](#8-install-the-three-systemd-services) — `systemctl show` reports them set while the kernel ignores them. Check whether it's already on:
+**Enable the memory cgroup controller.** Pi OS often leaves it off, silently neutering the `MemoryMax`/`MemoryHigh` caps from [step 8](#8-install-the-three-systemd-services) — `systemctl show` still reports them set. Check whether it's already on:
 
 ```bash
 cat /sys/fs/cgroup/cgroup.controllers      # if this lists 'memory', skip the next command
 ```
 
-If `memory` is absent, append the two parameters to the end of the single line in `/boot/firmware/cmdline.txt` (the file must stay one line — never add a newline). The `grep` guard keeps a re-run from duplicating them:
+If `memory` is absent, append both parameters to the single line in `/boot/firmware/cmdline.txt` — keep it one line, never add a newline. The `grep` guard makes re-runs idempotent:
 
 ```bash
 grep -q cgroup_enable=memory /boot/firmware/cmdline.txt || \
   sudo sed -i 's/$/ cgroup_enable=memory cgroup_memory=1/' /boot/firmware/cmdline.txt
 ```
 
-**Turn off things we won't use.** A headless Pi has no use for Bluetooth — disabling it frees a little RAM and removes a background service. Disable the hardware via overlay and stop the services:
+**Disable Bluetooth.** Unused on a headless Pi; frees a little RAM and one background service:
 
 ```bash
 echo 'dtoverlay=disable-bt' | sudo tee -a /boot/firmware/config.txt
@@ -66,7 +64,7 @@ cat /sys/fs/cgroup/cgroup.controllers      # now lists 'memory'
 
 ## Install (Pi to running service)
 
-**Prerequisites:** 64-bit Raspberry Pi OS (Lite is fine), run as your normal user, not root. Examples use the account name `user`; if yours differs, replace `user` and `/home/user/...` everywhere. The whole install works on your LAN; add [Tailscale](#remote-access-with-tailscale) for remote access.
+**Prerequisites:** 64-bit Raspberry Pi OS (Lite is fine), run as your normal user, not root. Examples use the account `user` — replace `user` and `/home/user/...` if yours differs. Works entirely on your LAN; add [Tailscale](#remote-access-with-tailscale) for remote access.
 
 ### 1. Install `uv`
 
@@ -88,34 +86,24 @@ cd dagster-pi
 
 ### 3. Add project dependencies
 
-Step 2 installed `dagster` core (which includes the `dagster-daemon` CLI) and put `dagster-webserver` in the **dev** group. Because this is running on a pi not Dagster+ , you need to promote the webserver to a runtime dependency, and add the DuckDB integration and driver (or db of choice).
-
-Run both commands:
+The scaffold put `dagster-webserver` in the **dev** group (the Dagster+ cloud assumption). Promote it to a runtime dependency and add DuckDB:
 
 ```bash
-# Add runtime deps. dagster-webserver depends on dagster core, so this one
-# line covers all three services (code-server, webserver, daemon) plus DuckDB.
 uv add "dagster-webserver==1.13.*" "dagster-duckdb>=0.29.9" "duckdb>=1.5.3"
-
-# Remove the dev-group copy of the webserver the scaffold added (now redundant).
 uv remove --dev dagster-webserver
 ```
 
-What each package is for:
-
 | Package | Provides |
 |---|---|
-| `dagster-webserver` | The UI + GraphQL server. Pulls in `dagster` core, which ships the daemon and code-server CLIs — so you don't add those separately. |
-| `dagster-duckdb` | Dagster's resource/I/O-manager layer for DuckDB. |
-| `duckdb` | The DuckDB engine itself. |
+| `dagster-webserver` | UI + GraphQL. Pulls in `dagster` core, which ships the daemon and code-server CLIs — so all three services come from this one line. |
+| `dagster-duckdb` | Dagster's resource / I/O-manager layer for DuckDB. |
+| `duckdb` | The engine itself. |
 
-`uv` resolves versions aligned with the installed `dagster`. On 64-bit Pi OS this pulls prebuilt `aarch64` wheels, no compiling.
+`uv` resolves versions against the installed `dagster` and pulls prebuilt `aarch64` wheels — no compiling.
 
 ### 4. Set up `DAGSTER_HOME`
 
-This is where Dagster holds instance state run and event storage (SQLite). It lives inside the project as `.dagster_home/`. Point `DAGSTER_HOME` outside the repo if you'd rather separate state from code.
-
-The config is optional (omit it for all-defaults); these three blocks are low-resource choices, each explained in [Tuning](#tuning-for-low-resources).
+Instance state — runs and events (SQLite) — kept in-project at `.dagster_home/` (point `DAGSTER_HOME` elsewhere to separate state from code). The config is optional; these blocks are low-resource choices, each explained in [Tuning](#tuning-for-low-resources):
 
 ```bash
 mkdir -p ~/dagster-pi/.dagster_home
@@ -142,7 +130,7 @@ EOF
 
 ### 5. Create the DuckDB data directory
 
-DuckDB won't create intermediate directories, so make it before the first asset run. It holds `pi.duckdb` and the spill dir (`.duckdb/.tmp`); gitignored; override the path with `PI_DUCKDB_PATH`.
+DuckDB won't create parent directories, so make it before the first asset run. Holds `pi.duckdb` and the spill dir (`.duckdb/.tmp`); gitignored; override the path with `PI_DUCKDB_PATH`.
 
 ```bash
 mkdir -p ~/dagster-pi/.duckdb
@@ -174,9 +162,9 @@ A fresh project has no definitions yet; `dg check defs` should still pass.
 
 ### 8. Install the three systemd services
 
-One unit per process, each in its own cgroup. What the resource caps do, and which actually take effect on a Pi, is covered in [Resource isolation](#resource-isolation-blast-radius-control); install as-is and tune later.
+One unit per process, each in its own cgroup. What the caps do and which actually bite on a Pi: [Resource isolation](#resource-isolation-blast-radius-control). Install as-is, tune later.
 
-> **systemd has no inline comments.** A `#` must start its own line or it folds into the value (`MemoryMax=5G  # note` breaks). Keep the comments below on their own lines.
+> **systemd has no inline comments** — a `#` must start its own line or it folds into the value (`MemoryMax=5G  # note` breaks). Mind that if you edit these.
 
 **Code-server** (gRPC). Runs and step-workers live in this cgroup, so its caps bound the real work; lowest CPU priority of the three.
 
@@ -278,7 +266,7 @@ sudo systemctl status dagster-code-server dagster-webserver dagster-daemon --no-
 http://<pi-ip>:3000
 ```
 
-Reachable from any device that can route to the Pi. Keep port 3000 off the public internet (do not port-forward it on your router). For remote access, use Tailscale.
+Reachable from any device that can route to the Pi. Keep port 3000 off the public internet — don't port-forward it; use Tailscale for remote access.
 
 ## Remote access with Tailscale
 
@@ -355,7 +343,14 @@ The `[Service]` caps in [step 8](#8-install-the-three-systemd-services) put each
 | `MemoryHigh` / `MemoryMax` | Throttle or OOM-kill a runaway run inside the code-server cgroup. Needs the kernel memory cgroup controller. | **Yes** (controller enabled in [Clean Pi OS Install](#clean-pi-os-install); `memory.max` reads 5 G, not `max`) |
 | `IOWeight` | Proportional disk I/O, only with a `bfq`-scheduled device. NVMe's default `none` scheduler exposes no `io.weight`. | **No** (harmless on NVMe) |
 
-On this host all four-of-interest are accounted for: CPU priority and `LimitAS` are proven, and `MemoryHigh`/`MemoryMax` now enforce because the kernel memory cgroup controller was enabled in [Clean Pi OS Install](#clean-pi-os-install). The trap worth knowing: `systemctl show` reports the cap as set even when the kernel isn't enforcing it, so don't trust it — confirm the controller is loaded (`cat /sys/fs/cgroup/cgroup.controllers` must list `memory`) and that the kernel actually took the value (`cat /sys/fs/cgroup/system.slice/dagster-code-server.service/memory.max` reads `5368709120`, not `max`). If the controller is ever off, `MemoryHigh`/`MemoryMax` go inert and aggregate protection falls back to `max_concurrent_runs × DuckDB memory_limit` (3 × 1.5 G = 4.5 G) staying within RAM.
+The trap worth knowing: `systemctl show` reports a cap as set even when the kernel isn't enforcing it. Don't trust it — confirm the controller is loaded and that the kernel took the value:
+
+```bash
+cat /sys/fs/cgroup/cgroup.controllers                                   # must list 'memory'
+cat /sys/fs/cgroup/system.slice/dagster-code-server.service/memory.max  # reads 5368709120, not 'max'
+```
+
+If the controller is off, `MemoryHigh`/`MemoryMax` go inert and protection falls back to `max_concurrent_runs × DuckDB memory_limit` (3 × 1.5 G = 4.5 G), still within RAM.
 
 Prove the guardrail with the bundled workload; a run that overshoots the caps should fail in well under a second while the UI stays responsive:
 
@@ -366,7 +361,7 @@ DAGSTER_HOME=/home/user/dagster-pi/.dagster_home \
   --config-json '{"ops":{"synthetic_load":{"config":{"rows":1,"mem_mb":7000}}}}'
 ```
 
-> **Which cap fires.** With `LimitAS=6G` set, a single ~6.8 G `bytearray` overshoots the 6 G address-space limit *before* any pages fault in, so the step raises a clean `MemoryError` and the process exits on its own — this is the guard you actually hit, controller on or off (measured: failed in 63 ms, all three services stayed up). The cgroup `MemoryMax=5G` OOM-killer only takes over for allocations that fit under `LimitAS` but grow resident past 5 G; on this host `MemoryHigh=4G` plus zram swap absorb most of that range first, so `LimitAS` is the effective wall for a single big alloc. Either way the box survives — confirm in the run's logs.
+> **Which cap fires.** With `LimitAS=6G`, a ~6.8 G `bytearray` overshoots the address-space limit *before* any pages fault in, so the step raises a clean `MemoryError` and exits on its own — the guard you actually hit, controller on or off. The cgroup `MemoryMax=5G` OOM-killer only takes over for allocations that fit under `LimitAS` but grow resident past 5 G, and here `MemoryHigh=4G` plus zram swap absorb most of that range first. So for a single big alloc `LimitAS` is the effective wall — either way the box survives.
 
 Caps take effect only after `sudo systemctl daemon-reload && sudo systemctl restart dagster-code-server dagster-webserver dagster-daemon`.
 
