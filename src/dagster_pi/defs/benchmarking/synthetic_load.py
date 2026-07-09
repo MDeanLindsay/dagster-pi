@@ -31,6 +31,12 @@ and snapshot with `bench.py` mid-run to see (or, after switching to
 Nothing here auto-runs: there is no schedule, so it stays idle on a real
 deployment until you trigger it. Data lands in its own `benchmark` schema, so
 `DROP SCHEMA benchmark CASCADE` removes every trace.
+
+Note: the asset sits in the `duckdb` concurrency pool (limit 1), so a backfill
+normally serializes run-by-run. To reproduce the N-concurrent numbers in
+benchmarks/README.md, raise the pool first:
+
+    uv run dagster instance concurrency set duckdb 4   # and back to 1 after
 """
 
 import os
@@ -39,7 +45,7 @@ import time
 import dagster as dg
 from dagster_duckdb import DuckDBResource
 
-from dagster_pi.defs.resources import spill_watch
+from dagster_pi.defs.resources import DUCKDB_POOL, spill_watch
 
 # Partition count == max fan-out of a full backfill. Override with BENCH_PARTITIONS.
 _N_PARTITIONS = int(os.getenv("BENCH_PARTITIONS", "24"))
@@ -61,6 +67,7 @@ class SyntheticConfig(dg.Config):
     group_name="benchmark",
     kinds={"duckdb", "python"},
     tags={"category": "benchmark"},
+    pool=DUCKDB_POOL,
 )
 def synthetic_load(
     context: dg.AssetExecutionContext,

@@ -28,8 +28,8 @@ the two are indistinguishable by command line. We tier them by **parent PID** in
     log-capture        the tiny compute-log tee children of a worker
 
 Workers are *spawned* — fresh interpreters that re-import privately, **not** forks —
-so they do not share a copy-on-write import heap with the parent (see ``cow_probe.py``
-for the smaps evidence). What they *do* share is file-backed library pages (libpython,
+so they do not share a copy-on-write import heap with the parent (smaps evidence in
+benchmarks/README.md). What they *do* share is file-backed library pages (libpython,
 libduckdb), mapped by every process, so **RSS double-counts those shared pages**. We
 therefore report **PSS** (proportional set size, from ``/proc/<pid>/smaps_rollup``) as
 the headline figure: PSS divides shared pages, so it sums across processes without

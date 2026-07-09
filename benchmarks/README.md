@@ -3,10 +3,8 @@
 A dependency-free `/proc` harness plus the measured effect of the deployment's low-resource tuning. Run it before and after a change; it appends a JSON record under `benchmarks/results/` (gitignored) and prints a markdown summary.
 
 - [bench.py](bench.py): point-in-time snapshot, tiered into services / run-workers / step-workers.
-- [backfill_probe.py](backfill_probe.py): drives a `synthetic_load` backfill and peak-samples it.
-- [cow_probe.py](cow_probe.py): dumps each run-worker's shared-vs-private page split.
 
-The workload all three drive is the [`synthetic_load`](../src/dagster_pi/defs/benchmarking/synthetic_load.py) asset. The tuning levers they measure are summarized in the [main README](../README.md#tuning-for-low-resources); this folder is where those numbers come from.
+The workload it measures against is the [`synthetic_load`](../src/dagster_pi/defs/benchmarking/synthetic_load.py) asset. (The one-off probe scripts that originally gathered the backfill-peak and copy-on-write numbers below answered their questions — executor choice, eager-loading — and have been removed; the method for reproducing each number with `bench.py` alone is described inline.) The tuning levers they measure are summarized in the [main README](../README.md#tuning-for-low-resources); this folder is where those numbers come from.
 
 ## The box under test
 
@@ -49,13 +47,15 @@ Cold import of `dagster_pi.definitions`: **0.95 s** (median of 3).
 
 ### The headline: in_process vs multiprocess, during a backfill
 
-Same workload both times: an 8-partition `synthetic_load` backfill at `max_concurrent_runs: 4`, each run a 10 s CPU spin + a 200k-row DuckDB write, driven and peak-sampled by [backfill_probe.py](backfill_probe.py). The peak is the single highest-total-PSS sample while 4 runs execute:
+Same workload both times: an 8-partition `synthetic_load` backfill at `max_concurrent_runs: 4`, each run a 10 s CPU spin + a 200k-row DuckDB write. The peak is the single highest-total-PSS sample while 4 runs execute. To reproduce, launch the backfill (UI → Assets → `synthetic_load` → Materialize → all partitions) and sample it from another shell:
 
 ```bash
-uv run python benchmarks/backfill_probe.py --label in_process
-# switch definitions.py to dg.multiprocess_executor, reload, re-run:
-uv run python benchmarks/backfill_probe.py --label multiprocess
+while true; do uv run python benchmarks/bench.py --label peak; sleep 2; done
+# keep the highest-total-PSS record from results.jsonl; then switch
+# definitions.py to dg.multiprocess_executor, reload, and repeat
 ```
+
+> **Reproducing this needs the `duckdb` pool raised first.** The deployment now ships `synthetic_load` in the `duckdb` concurrency pool at limit 1 (the single-writer guard from the [main README](../README.md#duckdb-pool)), which serializes a backfill run-by-run. These numbers predate the pool and assume 4 concurrent writers: `uv run dagster instance concurrency set duckdb 4` before the backfill, `... set duckdb 1` after.
 
 | peak during 4-concurrent backfill | multiprocess | in_process | delta |
 |---|--:|--:|--:|
@@ -79,7 +79,7 @@ Data lands in DuckDB's own `benchmark` schema; `DROP SCHEMA benchmark CASCADE` c
 
 ## Why eager-loading the code server won't help (run-workers spawn, not fork)
 
-A tempting optimization: the gRPC code server runs with `--lazy-load-user-code`. If it instead *eager-loaded* at startup, wouldn't concurrent run-workers (its children) inherit those import pages copy-on-write and cost almost nothing each? We measured first, with [cow_probe.py](cow_probe.py): it submits a backfill and dumps each run-worker's `/proc/<pid>/smaps_rollup` at peak concurrency.
+A tempting optimization: the gRPC code server runs with `--lazy-load-user-code`. If it instead *eager-loaded* at startup, wouldn't concurrent run-workers (its children) inherit those import pages copy-on-write and cost almost nothing each? We measured first, by dumping each run-worker's `/proc/<pid>/smaps_rollup` at peak concurrency during a backfill (run-workers are the children of the gRPC code-server process, so they are easy to find by parent PID).
 
 **The premise is false: run-workers are `multiprocessing.spawn` children, not forks.** Their command line is `python -c "from multiprocessing.spawn import spawn_main; ..."`, a fresh interpreter that re-imports `dagster` + user code into its *own private heap*. At a 3-concurrent backfill:
 

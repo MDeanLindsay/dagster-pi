@@ -108,9 +108,17 @@ Instance state — runs and events (SQLite) — kept in-project at `.dagster_hom
 ```bash
 mkdir -p ~/dagster-pi/.dagster_home
 cat > ~/dagster-pi/.dagster_home/dagster.yaml <<'EOF'
-# Cap concurrent runs; each run is its own process on 4 cores.
-run_queue:
-  max_concurrent_runs: 3
+# Cap concurrent runs (each is its own process on 4 cores), and serialize
+# anything in the "duckdb" pool: DuckDB allows one read-write process per
+# file, so runs that touch it wait in the queue instead of colliding over
+# the file lock. `granularity: run` holds them *before* dequeue, where a
+# waiting run costs zero RAM.
+concurrency:
+  runs:
+    max_concurrent_runs: 3
+  pools:
+    granularity: run
+    default_limit: 1
 
 # Don't phone home.
 telemetry:
@@ -162,7 +170,7 @@ A fresh project has no definitions yet; `dg check defs` should still pass.
 
 ### 8. Install the three systemd services
 
-One unit per process, each in its own cgroup. What the caps do and which actually bite on a Pi: [Resource isolation](#resource-isolation-blast-radius-control). Install as-is, tune later.
+One unit per process, each in its own cgroup. What the caps do and which actually bite on a Pi: [Resource isolation](#resource-isolation). Install as-is, tune later.
 
 > **systemd has no inline comments** — a `#` must start its own line or it folds into the value (`MemoryMax=5G  # note` breaks). Mind that if you edit these.
 
@@ -306,9 +314,10 @@ Stock defaults run fine. The changes below (all already applied in this repo) ma
 |---|---|---|---|
 | `in_process_executor` | [definitions.py](src/dagster_pi/definitions.py) | Steps run inside the run process instead of forking a ~100 MB step-worker each. Runs still parallelize at the run level. | saves 378 MB PSS during a 4-concurrent backfill |
 | `max_concurrent_runs: 3` | [dagster.yaml](.dagster_home/dagster.yaml) | A backfill peaks at 3 run-workers (~107 MB each, unshareable), not 4, and eases CPU oversubscription. | peak 3 × ~107 MB |
-| DuckDB caps | [resources.py](src/dagster_pi/defs/resources.py) | `memory_limit=1.5GB`, `threads=2`, NVMe spill. One query can't grab ~80% of RAM and every core; 3 × 1.5 GB also bounds aggregate DuckDB RAM. | guardrail |
+| `duckdb` pool, limit 1 | [dagster.yaml](.dagster_home/dagster.yaml) + `pool=` in [resources.py](src/dagster_pi/defs/resources.py) | Serializes every DuckDB-touching run at the queue — no file-lock collisions, and a waiting run costs 0 RAM instead of a live worker spinning in connect retries. Details: [DuckDB pool](#duckdb-pool). | guardrail |
+| DuckDB caps | [resources.py](src/dagster_pi/defs/resources.py) | `memory_limit=3GB`, `threads=4`, NVMe spill. One query can't grab ~80% of RAM; sized for the single live instance the pool guarantees, under the cgroup's `MemoryHigh=4G`. | guardrail |
 | glibc arena cap | [code-server unit](#8-install-the-three-systemd-services) | `MALLOC_ARENA_MAX=2` curbs malloc-arena fragmentation; run-workers inherit it. | ~7%, code-server tier |
-| cgroup isolation | systemd units | Per-process caps so a runaway asset OOMs in its own cgroup, not the box. | see [below](#resource-isolation-blast-radius-control) |
+| cgroup isolation | systemd units | Per-process caps so a runaway asset OOMs in its own cgroup, not the box. | see [below](#resource-isolation) |
 | Telemetry off | [dagster.yaml](.dagster_home/dagster.yaml) | No usage stats leave the box. | n/a |
 | Tick retention | [dagster.yaml](.dagster_home/dagster.yaml) | Schedule/sensor ticks auto-purge instead of growing forever. | n/a |
 
@@ -319,20 +328,34 @@ Stock defaults run fine. The changes below (all already applied in this repo) ma
 
 - **The 378 MB saving is during a backfill.** It is the step-worker tier the executor removes, and it scales with `max_concurrent_runs × steps-per-run`.
 
-- **The DuckDB cap is a guardrail, not a footprint cut.** Its payoff: a heavy or buggy query can no longer grab most of RAM and all cores and OOM the box.
+### DuckDB pool
 
-### Running a job heavier than the cap
+DuckDB permits **one read-write process per database file**. The `in_process_executor` serializes steps *within* a run, but `max_concurrent_runs: 3` still lets three runs each open `pi.duckdb` read-write. `dagster-duckdb` papers over the collision with a connect-retry loop (10 attempts, ~100 s of exponential backoff), so overlapping runs appear to work — until one writer holds the lock longer than the backoff window and the colliding run fails. Meanwhile each retrying run is a live ~107 MB worker doing nothing.
 
-The cap is a spill threshold, not a wall: past `memory_limit` DuckDB spills to the NVMe temp dir and finishes slower, not failed.
+The fix is declarative, in two halves:
 
-- **Raise the caps for a known-heavy one-off** (all three are env-overridable). Keep `caps × max_concurrent_runs` inside RAM:
+- Every asset that opens the `duckdb` resource declares `pool=DUCKDB_POOL` ([resources.py](src/dagster_pi/defs/resources.py)).
+- `dagster.yaml` gives pools `default_limit: 1` with `granularity: run`, so the run coordinator holds a second DuckDB run **in the queue** — where it costs zero RAM — until the first finishes.
+
+Runs that don't touch DuckDB are unaffected and still parallelize up to `max_concurrent_runs`.
+
+### DuckDB caps
+
+The caps are a guardrail: a heavy or buggy query can't grab most of RAM and every core and OOM the box. The memory cap is a spill threshold, not a wall — past `memory_limit` DuckDB spills to the NVMe temp dir and finishes slower, not failed.
+
+- **Raise the cap for a known-heavy one-off** (all three settings are env-overridable). Just keep the cap under the code-server cgroup's `MemoryHigh=4G` minus ~300 MB of process overhead:
+
   ```bash
-  PI_DUCKDB_MEMORY_LIMIT=4GB PI_DUCKDB_THREADS=4 \
+  PI_DUCKDB_MEMORY_LIMIT=3.5GB \
     uv run dagster job launch -j synthetic_load_job -w workspace.yaml
   ```
 - **Spilling is invisible unless you measure it.** The `spill_watch` helper ([resources.py](src/dagster_pi/defs/resources.py)) samples the spill dir and logs the peak (and a `peak_spill_mb` metadata field) only when a run actually spilled. The caps bound DuckDB memory only; Python-side memory (e.g. `fetchall` into a giant list) is bounded by `LimitAS`, so stream results rather than materialize them.
 
-### Resource isolation (blast-radius control)
+### glibc arena cap
+
+The two `Environment=MALLOC_*` lines in the [code-server unit](#8-install-the-three-systemd-services), kept on the code-server only because its spawned run-workers inherit the env block.
+
+### Resource isolation
 
 The `[Service]` caps in [step 8](#8-install-the-three-systemd-services) put each process in its own cgroup so a runaway asset dies without taking the UI or `sshd` with it. Whether each directive is actually enforced on a Pi 5:
 
@@ -343,42 +366,9 @@ The `[Service]` caps in [step 8](#8-install-the-three-systemd-services) put each
 | `MemoryHigh` / `MemoryMax` | Throttle or OOM-kill a runaway run inside the code-server cgroup. Needs the kernel memory cgroup controller. | **Yes** (controller enabled in [Clean Pi OS Install](#clean-pi-os-install); `memory.max` reads 5 G, not `max`) |
 | `IOWeight` | Proportional disk I/O, only with a `bfq`-scheduled device. NVMe's default `none` scheduler exposes no `io.weight`. | **No** (harmless on NVMe) |
 
-The trap worth knowing: `systemctl show` reports a cap as set even when the kernel isn't enforcing it. Don't trust it — confirm the controller is loaded and that the kernel took the value:
-
-```bash
-cat /sys/fs/cgroup/cgroup.controllers                                   # must list 'memory'
-cat /sys/fs/cgroup/system.slice/dagster-code-server.service/memory.max  # reads 5368709120, not 'max'
-```
-
-If the controller is off, `MemoryHigh`/`MemoryMax` go inert and protection falls back to `max_concurrent_runs × DuckDB memory_limit` (3 × 1.5 G = 4.5 G), still within RAM.
-
-Prove the guardrail with the bundled workload; a run that overshoots the caps should fail in well under a second while the UI stays responsive:
-
-```bash
-DAGSTER_HOME=/home/user/dagster-pi/.dagster_home \
-  uv run dagster job launch -j synthetic_load_job -w workspace.yaml \
-  --tags '{"dagster/partition":"part-000"}' \
-  --config-json '{"ops":{"synthetic_load":{"config":{"rows":1,"mem_mb":7000}}}}'
-```
-
-> **Which cap fires.** With `LimitAS=6G`, a ~6.8 G `bytearray` overshoots the address-space limit *before* any pages fault in, so the step raises a clean `MemoryError` and exits on its own — the guard you actually hit, controller on or off. The cgroup `MemoryMax=5G` OOM-killer only takes over for allocations that fit under `LimitAS` but grow resident past 5 G, and here `MemoryHigh=4G` plus zram swap absorb most of that range first. So for a single big alloc `LimitAS` is the effective wall — either way the box survives.
+If the controller is off, `MemoryHigh`/`MemoryMax` go inert and protection falls back to the `duckdb` pool times the DuckDB `memory_limit` (one writer × 3 G), still within RAM.
 
 Caps take effect only after `sudo systemctl daemon-reload && sudo systemctl restart dagster-code-server dagster-webserver dagster-daemon`.
-
-### Why not eager-load the code server
-
-A tempting next step is to eager-load user code in the gRPC server so run-workers inherit those imports copy-on-write. We measured first, and the premise is false: run-workers are `multiprocessing.spawn` children, not forks. Each starts a fresh interpreter and re-imports `dagster` plus user code into its own ~94 MB private heap, so eager-loading the parent only fattens its idle footprint for zero per-run benefit. (Forking would enable COW, but it risks deadlock in the multi-threaded gRPC server, which is exactly why Dagster spawns.)
-
-Per-run cost is ~107 MB and unshareable. The only two levers that cut concurrent-backfill RAM: **fewer workers** (the 4 to 3 drop) and **keeping small recurring work off run-workers** (run a heartbeat or metrics scrape inline in the resident daemon via a sensor, not a fresh ~107 MB worker per tick). Full breakdown: [benchmarks/README.md](benchmarks/README.md#why-eager-loading-the-code-server-wont-help-run-workers-spawn-not-fork).
-
-### glibc arena cap
-
-The two `Environment=MALLOC_*` lines in the [code-server unit](#8-install-the-three-systemd-services), kept on the code-server only because its spawned run-workers inherit the env block (the measured payoff); a fresh-start A/B showed no reproducible benefit on the webserver or daemon. Verify it is live:
-
-```bash
-sudo systemctl daemon-reload && sudo systemctl restart dagster-code-server
-systemctl show -p Environment dagster-code-server   # MALLOC_ARENA_MAX=2 should appear
-```
 
 ### Keeping instance state bounded
 
@@ -394,9 +384,9 @@ uv run python benchmarks/bench.py --label before
 uv run python benchmarks/bench.py --label after
 ```
 
-Two probes catch what a snapshot can't: [`backfill_probe.py`](benchmarks/backfill_probe.py) drives and peak-samples a backfill (the source of the 378 MB delta), and [`cow_probe.py`](benchmarks/cow_probe.py) dumps each run-worker's shared-vs-private page split (which disproved eager-loading). Full numbers and method: [benchmarks/README.md](benchmarks/README.md).
+Numbers that only exist *during* load (the 378 MB backfill delta, the per-run-worker cost) come from sampling `bench.py` in a loop while a backfill runs. Full numbers and method: [benchmarks/README.md](benchmarks/README.md).
 
-> **The harness is optional scaffolding.** The `synthetic_load` workload lives in its own [`defs/benchmarking/`](src/dagster_pi/defs/benchmarking/) package and the probes in [`benchmarks/`](benchmarks/); delete both directories to drop the benchmarking apparatus entirely. Nothing in the deployment (the `duckdb` resource, maintenance, the services) depends on either.
+> **The harness is optional scaffolding.** The `synthetic_load` workload lives in its own [`defs/benchmarking/`](src/dagster_pi/defs/benchmarking/) package and the harness in [`benchmarks/`](benchmarks/); delete both directories to drop the benchmarking apparatus entirely. Nothing in the deployment (the `duckdb` resource, maintenance, the services) depends on either.
 
 ## Development and publishing
 
@@ -405,5 +395,3 @@ Set up to be published as a template:
 - **[LICENSE](LICENSE):** MIT.
 - **Secret scanning:** [`.pre-commit-config.yaml`](.pre-commit-config.yaml) runs [gitleaks](https://github.com/gitleaks/gitleaks), ruff, and basic file hygiene on every commit. Install once with `uv run pre-commit install`. All config flows through systemd `Environment=` and `os.getenv` defaults, so there is no committed `.env` (it is gitignored).
 - **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `dg check defs`, a `bench.py` smoke test, and a gitleaks scan on every push and PR.
-
-Before committing: `uv run dg check defs`.

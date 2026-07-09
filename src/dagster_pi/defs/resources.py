@@ -6,20 +6,29 @@ repo root regardless of username or clone location.
 Override with the PI_DUCKDB_PATH env var (e.g. in the systemd unit) if it moves.
 The connection is lazy, so importing this module never opens the file.
 
-DuckDB defaults to ~80% of RAM and every core. On a shared Pi that lets one big
-query starve the webserver + daemon (or OOM the box) during a concurrent run, so
-we cap the connection:
+DuckDB allows one read-write process per file, so every asset that opens this
+resource must carry ``pool=DUCKDB_POOL``: the instance-level pool (limit 1,
+``concurrency:`` in dagster.yaml) serializes those runs at the queue, where a
+waiting run costs nothing. Without it, colliding runs sit in dagster-duckdb's
+connect-retry loop (~100 s of backoff inside a live ~107 MB run-worker) and fail
+outright if the writer holds the lock longer.
 
-    memory_limit    per-connection working-set cap (default 1.5GB). With the
-                    cgroup MemoryMax inert on this host, this cap times
-                    run_queue.max_concurrent_runs (3) is the real aggregate RAM
-                    guard: 3 x 1.5GB = 4.5GB, leaving ~3.5GB for UI/daemon/OS.
-    threads         cores a query may grab (default 2 of 4 — leaves headroom for
-                    the webserver/daemon to stay responsive under a heavy query)
+DuckDB also defaults to ~80% of RAM and every core. On a shared Pi that lets one
+big query starve the webserver + daemon — or blow through the code-server
+cgroup's MemoryMax and get the run OOM-killed mid-write instead of spilling. So
+we cap the connection, sized for the ONE live instance the pool guarantees:
+
+    memory_limit    working-set cap (default 3GB). Past it DuckDB spills to
+                    temp_directory instead of failing. Keeps the lone writer plus
+                    its run-worker and the gRPC server under the code-server
+                    cgroup's MemoryHigh=4G.
+    threads         cores a query may grab (default 4 — a single writer can't
+                    oversubscribe, and CPUWeight/Nice keep the UI responsive).
     temp_directory  where DuckDB spills to disk when it hits memory_limit, rather
                     than failing — kept under ~/.duckdb/.tmp
 
-All three are env-overridable; raise them for a one-off heavy backfill if needed.
+All three are env-overridable; raise memory_limit for a one-off heavy backfill,
+keeping it under the cgroup's MemoryHigh=4G minus ~300 MB of process overhead.
 """
 
 import os
@@ -35,12 +44,17 @@ _PROJECT_ROOT = os.path.dirname(
 DUCKDB_PATH = os.getenv(
     "PI_DUCKDB_PATH", os.path.join(_PROJECT_ROOT, ".duckdb", "pi.duckdb")
 )
-DUCKDB_MEMORY_LIMIT = os.getenv("PI_DUCKDB_MEMORY_LIMIT", "1.5GB")
-DUCKDB_THREADS = int(os.getenv("PI_DUCKDB_THREADS", "2"))
+DUCKDB_MEMORY_LIMIT = os.getenv("PI_DUCKDB_MEMORY_LIMIT", "3GB")
+DUCKDB_THREADS = int(os.getenv("PI_DUCKDB_THREADS", "4"))
 DUCKDB_TEMP_DIR = os.getenv(
     "PI_DUCKDB_TEMP_DIR",
     os.path.join(_PROJECT_ROOT, ".duckdb", ".tmp"),
 )
+
+# Concurrency-pool name for anything that opens the DuckDB file read-write.
+# dagster.yaml gives every pool a default limit of 1 with run granularity, so
+# tagging an asset `pool=DUCKDB_POOL` is what enforces the single writer.
+DUCKDB_POOL = "duckdb"
 
 
 def _dir_size_bytes(path: str) -> int:
